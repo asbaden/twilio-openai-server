@@ -203,11 +203,6 @@ def handle_media_stream(ws):
 async def handle_media_stream_async(ws):
     """Async handler for media streaming"""
     try:
-        # Verify WebSocket is valid
-        if not ws:
-            logger.error("Invalid WebSocket connection")
-            return
-            
         # Send initial connection confirmation
         try:
             await ws.send(json.dumps({"event": "connected"}))
