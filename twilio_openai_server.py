@@ -10,6 +10,7 @@ from twilio.twiml.voice_response import VoiceResponse, Connect, Start
 from dotenv import load_dotenv
 import threading
 import traceback
+from supabase import create_client, Client
 
 # Load environment variables
 load_dotenv()
@@ -23,6 +24,11 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 sock = Sock(app)
 
+# Initialize Supabase client
+supabase_url = os.getenv('SUPABASE_URL')
+supabase_key = os.getenv('SUPABASE_ANON_KEY')
+supabase: Client = create_client(supabase_url, supabase_key)
+
 # Constants
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
 VOICE = "echo"  # Options: alloy, ash, ballad, coral, echo, sage, shimmer, verse
@@ -32,6 +38,45 @@ LOG_EVENT_TYPES = ["session.updated", "response.text.delta", "turn.start", "turn
 # Counter for audio packets
 audio_packets_from_twilio = 0
 audio_packets_to_twilio = 0
+
+@app.route('/schedule_call', methods=['POST'])
+def schedule_call():
+    """Handle call scheduling requests"""
+    try:
+        data = request.get_json()
+        logger.info(f"Received scheduling request: {data}")
+        
+        # Validate required fields
+        if not data or 'phone_number' not in data or 'scheduled_time' not in data:
+            return Response(
+                json.dumps({"error": "Missing required fields: phone_number and scheduled_time"}),
+                status=400,
+                mimetype='application/json'
+            )
+        
+        # Insert into Supabase
+        result = supabase.table('scheduled_calls').insert({
+            'phone_number': data['phone_number'],
+            'scheduled_time': data['scheduled_time'],
+            'status': 'pending',
+            'metadata': data.get('metadata', {})
+        }).execute()
+        
+        logger.info(f"Scheduled call created: {result}")
+        
+        return Response(
+            json.dumps({"message": "Call scheduled successfully", "data": result.data[0]}),
+            status=200,
+            mimetype='application/json'
+        )
+        
+    except Exception as e:
+        logger.error(f"Error scheduling call: {str(e)}")
+        return Response(
+            json.dumps({"error": str(e)}),
+            status=500,
+            mimetype='application/json'
+        )
 
 # Route to handle incoming calls
 @app.route('/voice', methods=['POST'])
