@@ -263,10 +263,11 @@ def create_openai_session():
         'https://api.openai.com/v1/realtime/sessions',
         headers={
             'Authorization': f'Bearer {OPENAI_API_KEY}',
-            'Content-Type': 'application/json'
+            'Content-Type': 'application/json',
+            'OpenAI-Beta': 'realtime=v1'
         },
         json={
-            'model': 'gpt-4o-realtime-preview-2024-12-17',
+            'model': 'gpt-4-turbo',
             'modalities': ['audio', 'text'],
             'instructions': SYSTEM_MESSAGE,
             'voice': VOICE,
@@ -281,7 +282,9 @@ def create_openai_session():
                 'prefix_padding_ms': 300,
                 'silence_duration_ms': 500,
                 'create_response': True
-            }
+            },
+            'temperature': 0.8,
+            'max_response_output_tokens': 'inf'
         }
     )
     
@@ -301,18 +304,20 @@ def handle_media_stream(ws):
         
         # Connect to OpenAI WebSocket
         openai_ws = websocket.WebSocketApp(
-            'wss://api.openai.com/v1/audio-chat/realtime',
+            'wss://api.openai.com/v1/audio/speech',
             header={
                 'Authorization': f'Bearer {client_secret}',
-                'Content-Type': 'application/json'
+                'Content-Type': 'application/json',
+                'OpenAI-Beta': 'realtime=v1'
             },
             on_message=lambda ws, msg: handle_openai_message(ws, msg, ws),
             on_error=lambda ws, error: logger.error(f"OpenAI WebSocket error: {error}"),
-            on_close=lambda ws, code, reason: logger.info(f"OpenAI WebSocket closed: {code} - {reason}")
+            on_close=lambda ws, code, reason: logger.info(f"OpenAI WebSocket closed: {code} - {reason}"),
+            on_open=lambda ws: logger.info("OpenAI WebSocket opened")
         )
         
         # Start OpenAI WebSocket connection
-        openai_ws_thread = threading.Thread(target=openai_ws.run_forever)
+        openai_ws_thread = threading.Thread(target=lambda: openai_ws.run_forever(ping_interval=30, ping_timeout=10))
         openai_ws_thread.daemon = True
         openai_ws_thread.start()
         
@@ -333,7 +338,14 @@ def handle_media_stream(ws):
                 'instructions': SYSTEM_MESSAGE,
                 'voice': VOICE,
                 'input_audio_format': 'pcm16',
-                'output_audio_format': 'pcm16'
+                'output_audio_format': 'pcm16',
+                'turn_detection': {
+                    'type': 'server_vad',
+                    'threshold': 0.5,
+                    'prefix_padding_ms': 300,
+                    'silence_duration_ms': 500,
+                    'create_response': True
+                }
             }
         }))
         
@@ -377,7 +389,7 @@ def handle_openai_message(ws, message, twilio_ws):
             audio_data = base64.b64decode(msg['delta'])
             twilio_ws.send(json.dumps({
                 'event': 'media',
-                'streamSid': 'STREAM_SID',
+                'streamSid': twilio_ws.stream_sid if hasattr(twilio_ws, 'stream_sid') else None,
                 'media': {
                     'payload': base64.b64encode(audio_data).decode('utf-8')
                 }
@@ -385,6 +397,12 @@ def handle_openai_message(ws, message, twilio_ws):
             
         elif msg_type == 'error':
             logger.error(f"OpenAI error: {msg['error']}")
+            
+        elif msg_type == 'session.updated':
+            logger.info("Session configuration updated")
+            
+        elif msg_type == 'response.text.delta':
+            logger.info(f"AI response: {msg.get('delta', '')}")
             
     except Exception as e:
         logger.error(f"Error handling OpenAI message: {str(e)}")
