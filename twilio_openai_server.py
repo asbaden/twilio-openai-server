@@ -9,6 +9,7 @@ from flask_sock import Sock
 from twilio.twiml.voice_response import VoiceResponse, Connect, Start
 from dotenv import load_dotenv
 import threading
+import traceback
 
 # Load environment variables
 load_dotenv()
@@ -69,68 +70,93 @@ def voice():
 
 # WebSocket handler for media streams
 @sock.route('/media-stream')
-def handle_media_stream(ws):
-    """Handle WebSocket connections between Twilio and OpenAI."""
-    global audio_packets_from_twilio, audio_packets_to_twilio
-    
-    logger.info("Client connected to WebSocket")
-    logger.debug("WebSocket connection details:")
-    logger.debug(f"Headers: {request.headers}")
-    logger.debug(f"Environment: {request.environ}")
-    
+async def handle_media_stream(ws):
+    """Handle WebSocket connection for media streaming"""
     try:
-        # Send an initial message to confirm connection
-        ws.send(json.dumps({
-            "event": "connected",
-            "message": "WebSocket connection established"
-        }))
+        # Send initial connection confirmation
+        await ws.send(json.dumps({"event": "connected"}))
         logger.info("Sent initial connection confirmation")
         
-        # This function will run in a separate thread
-        def process_media():
+        # Connect to OpenAI Realtime API
+        logger.info("Connecting to OpenAI Realtime API...")
+        logger.debug(f"Using OpenAI API Key: sk-tX{OPENAI_API_KEY[:4]}...")
+        
+        async with websockets.connect(
+            "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-10-01",
+            extra_headers={
+                "Authorization": f"Bearer {OPENAI_API_KEY}",
+                "OpenAI-Beta": "realtime=v1"
+            }
+        ) as openai_ws:
+            logger.info("Connected to OpenAI Realtime API successfully")
+            
+            # Send session update to OpenAI
+            logger.info("Sending session update to OpenAI")
+            session_update = {
+                "type": "session.update",
+                "session": {
+                    "turn_detection": {"type": "server_vad"},
+                    "input_audio_format": "g711_ulaw",
+                    "output_audio_format": "g711_ulaw",
+                    "voice": VOICE,
+                    "instructions": SYSTEM_MESSAGE,
+                    "modalities": ["text", "audio"],
+                    "temperature": 0.8
+                }
+            }
+            logger.debug(f"Session update data: {session_update}")
+            await openai_ws.send(json.dumps(session_update))
+            logger.info("Session update sent successfully")
+            
+            # Start WebSocket receiver
+            logger.info("Starting WebSocket receiver")
+            receiver_task = asyncio.create_task(ws_receiver(openai_ws, ws))
+            
+            # Start audio streaming between Twilio and OpenAI
+            logger.info("Starting audio streaming between Twilio and OpenAI")
             try:
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                
-                # Run the async function in the new event loop
-                loop.run_until_complete(process_media_async(ws))
+                logger.debug("Starting to receive from Twilio")
+                async for message in ws:
+                    try:
+                        data = json.loads(message)
+                        if data.get("event") == "media":
+                            # Forward audio to OpenAI
+                            await openai_ws.send(json.dumps({
+                                "type": "input_audio_buffer.append",
+                                "audio": data["media"]["payload"]
+                            }))
+                            logger.debug("Successfully sent audio to OpenAI")
+                    except Exception as e:
+                        logger.error(f"Error processing message: {str(e)}")
+                        continue
+            except websockets.exceptions.ConnectionClosed:
+                logger.info("WebSocket connection closed normally")
             except Exception as e:
-                logger.error(f"Error in process_media thread: {e}", exc_info=True)
+                logger.error(f"Error in WebSocket receive process: {str(e)}")
+                logger.error(traceback.format_exc())
             finally:
+                # Cancel receiver task
+                receiver_task.cancel()
                 try:
-                    loop.close()
+                    await receiver_task
+                except asyncio.CancelledError:
+                    pass
+                
+                # Close connections
+                try:
+                    await ws.close()
+                    logger.info("WebSocket connection closed")
                 except Exception as e:
-                    logger.error(f"Error closing event loop: {e}", exc_info=True)
-        
-        # Start the processing in a separate thread
-        thread = threading.Thread(target=process_media)
-        thread.daemon = True
-        thread.start()
-        
-        # Keep the WebSocket connection open
-        while True:
-            try:
-                # This will block until a message is received or the connection is closed
-                message = ws.receive()
-                if message is None:
-                    logger.info("Received None message, closing connection")
-                    break
-                logger.debug(f"Received message: {message[:100]}...")
-            except Exception as e:
-                if "Connection closed" in str(e):
-                    logger.info("WebSocket connection closed normally")
-                    break
-                logger.error(f"Error in WebSocket receive: {e}", exc_info=True)
-                break
+                    logger.error(f"Error closing WebSocket: {str(e)}")
+                    logger.error(traceback.format_exc())
+                
     except Exception as e:
-        logger.error(f"Error in handle_media_stream: {e}", exc_info=True)
-    finally:
-        logger.info("WebSocket connection closed")
+        logger.error(f"Error in handle_media_stream: {str(e)}")
+        logger.error(traceback.format_exc())
         try:
-            if not ws.closed:
-                ws.close()
-        except Exception as e:
-            logger.error(f"Error closing WebSocket: {e}", exc_info=True)
+            await ws.close()
+        except:
+            pass
 
 # Async function to process media
 async def process_media_async(ws):
