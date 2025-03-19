@@ -76,6 +76,24 @@ def validate_scheduled_time(scheduled_time):
     except Exception as e:
         raise ValueError(f"Invalid scheduled time format. Please use ISO format (YYYY-MM-DDTHH:MM:SSZ). Error: {str(e)}")
 
+@app.route('/')
+def index():
+    """Root endpoint - health check"""
+    return Response(
+        json.dumps({
+            "status": "healthy",
+            "version": "1.0.0",
+            "endpoints": [
+                "/voice",
+                "/media-stream",
+                "/schedule_call",
+                "/call_status"
+            ]
+        }),
+        status=200,
+        mimetype='application/json'
+    )
+
 @app.route('/schedule_call', methods=['POST'])
 def schedule_call():
     """Handle call scheduling requests"""
