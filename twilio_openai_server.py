@@ -199,6 +199,7 @@ def handle_media_stream(ws):
         
         # Create event to signal when OpenAI connection is ready
         openai_ready = threading.Event()
+        session_updated = threading.Event()
         
         def on_open(wsapp):
             logger.info("OpenAI WebSocket opened")
@@ -207,12 +208,13 @@ def handle_media_stream(ws):
         def on_message(wsapp, message):
             try:
                 response = json.loads(message)
+                logger.debug(f"Received message from OpenAI: {response.get('type')}")
                 
-                if response.get("type") in LOG_EVENT_TYPES:
-                    logger.info(f"Received event from OpenAI: {response['type']}")
-                    logger.debug(f"Event data: {response}")
-                    
-                if response.get("type") == "output_audio_buffer.append":
+                if response.get("type") == "session.updated":
+                    logger.info("Session update confirmed")
+                    session_updated.set()
+                
+                elif response.get("type") == "output_audio_buffer.append":
                     # Forward audio to Twilio
                     ws.send(json.dumps({
                         "event": "media",
@@ -237,9 +239,17 @@ def handle_media_stream(ws):
         def on_close(wsapp, close_status_code, close_msg):
             logger.info(f"OpenAI WebSocket closed: {close_status_code} - {close_msg}")
         
+        def on_ping(wsapp, message):
+            logger.debug("Received ping from OpenAI")
+            wsapp.send_pong(message)
+        
+        def on_pong(wsapp, message):
+            logger.debug("Received pong from OpenAI")
+        
         # Create WebSocket connection to OpenAI
+        websocket.enableTrace(True)  # Enable detailed WebSocket logging
         openai_ws = websocket.WebSocketApp(
-            "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-10-01",
+            "wss://api.openai.com/v1/audio-chat/realtime",
             header={
                 "Authorization": f"Bearer {OPENAI_API_KEY}",
                 "OpenAI-Beta": "realtime=v1"
@@ -247,11 +257,13 @@ def handle_media_stream(ws):
             on_open=on_open,
             on_message=on_message,
             on_error=on_error,
-            on_close=on_close
+            on_close=on_close,
+            on_ping=on_ping,
+            on_pong=on_pong
         )
         
         # Start OpenAI WebSocket connection in a separate thread
-        openai_thread = threading.Thread(target=openai_ws.run_forever)
+        openai_thread = threading.Thread(target=lambda: openai_ws.run_forever(ping_interval=30, ping_timeout=10))
         openai_thread.daemon = True
         openai_thread.start()
         
@@ -277,7 +289,12 @@ def handle_media_stream(ws):
         }
         logger.debug(f"Session update data: {session_update}")
         openai_ws.send(json.dumps(session_update))
-        logger.info("Session update sent successfully")
+        
+        # Wait for session update confirmation
+        if not session_updated.wait(timeout=10):
+            raise Exception("Timeout waiting for session update confirmation")
+        
+        logger.info("Session update confirmed")
         
         # Track stream SID
         stream_sid = None
@@ -287,6 +304,7 @@ def handle_media_stream(ws):
             try:
                 message = ws.receive()
                 data = json.loads(message)
+                logger.debug(f"Received message from Twilio: {data.get('event')}")
                 
                 if data.get("event") == "start":
                     stream_sid = data["start"]["streamSid"]
@@ -297,7 +315,7 @@ def handle_media_stream(ws):
                     openai_ws.send(json.dumps({
                         "type": "input_audio_buffer.append",
                         "audio": data["media"]["payload"]
-                    }))
+                    }), opcode=websocket.ABNF.OPCODE_TEXT)
                     logger.debug("Successfully sent audio to OpenAI")
                     
             except Exception as e:
