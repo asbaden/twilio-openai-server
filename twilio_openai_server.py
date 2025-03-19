@@ -11,6 +11,9 @@ from dotenv import load_dotenv
 import threading
 import traceback
 from supabase import create_client, Client
+from datetime import datetime, timezone
+import requests
+import time
 
 # Load environment variables
 load_dotenv()
@@ -31,6 +34,9 @@ supabase: Client = create_client(supabase_url, supabase_key)
 
 # Constants
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
+TWILIO_ACCOUNT_SID = os.getenv('TWILIO_ACCOUNT_SID')
+TWILIO_AUTH_TOKEN = os.getenv('TWILIO_AUTH_TOKEN')
+TWILIO_PHONE_NUMBER = os.getenv('TWILIO_PHONE_NUMBER')
 VOICE = "echo"  # Options: alloy, ash, ballad, coral, echo, sage, shimmer, verse
 SYSTEM_MESSAGE = "You are Claude, a helpful AI assistant speaking with Gus. Keep your responses concise and conversational. You're speaking on a phone call."
 LOG_EVENT_TYPES = ["session.updated", "response.text.delta", "turn.start", "turn.end", "error"]
@@ -38,6 +44,67 @@ LOG_EVENT_TYPES = ["session.updated", "response.text.delta", "turn.start", "turn
 # Counter for audio packets
 audio_packets_from_twilio = 0
 audio_packets_to_twilio = 0
+
+def check_scheduled_calls():
+    """Background task to check for and execute scheduled calls"""
+    while True:
+        try:
+            # Get current time in UTC
+            now = datetime.now(timezone.utc)
+            
+            # Query for pending calls that are due
+            result = supabase.table('scheduled_calls').select("*").eq('status', 'pending').execute()
+            
+            for call in result.data:
+                scheduled_time = datetime.fromisoformat(call['scheduled_time'].replace('Z', '+00:00'))
+                
+                # If the scheduled time has passed
+                if scheduled_time <= now:
+                    try:
+                        # Make the call using Twilio
+                        response = requests.post(
+                            f'https://api.twilio.com/2010-04-01/Accounts/{TWILIO_ACCOUNT_SID}/Calls.json',
+                            auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN),
+                            data={
+                                'To': call['phone_number'],
+                                'From': TWILIO_PHONE_NUMBER,
+                                'Url': f'https://{os.getenv("RENDER_URL", "twilio-openai-server.onrender.com")}/voice'
+                            }
+                        )
+                        
+                        if response.status_code == 201:
+                            # Update call status to completed
+                            supabase.table('scheduled_calls').update({
+                                'status': 'completed',
+                                'call_sid': response.json()['sid']
+                            }).eq('id', call['id']).execute()
+                            logger.info(f"Successfully initiated call {call['id']}")
+                        else:
+                            # Update call status to failed
+                            supabase.table('scheduled_calls').update({
+                                'status': 'failed',
+                                'error_message': f"Twilio API error: {response.text}"
+                            }).eq('id', call['id']).execute()
+                            logger.error(f"Failed to initiate call {call['id']}: {response.text}")
+                            
+                    except Exception as e:
+                        # Update call status to failed
+                        supabase.table('scheduled_calls').update({
+                            'status': 'failed',
+                            'error_message': str(e)
+                        }).eq('id', call['id']).execute()
+                        logger.error(f"Error processing call {call['id']}: {str(e)}")
+            
+            # Sleep for 1 minute before checking again
+            time.sleep(60)
+            
+        except Exception as e:
+            logger.error(f"Error in check_scheduled_calls: {str(e)}")
+            time.sleep(60)  # Sleep for 1 minute before retrying
+
+# Start the background task
+scheduler_thread = threading.Thread(target=check_scheduled_calls, daemon=True)
+scheduler_thread.start()
 
 @app.route('/schedule_call', methods=['POST'])
 def schedule_call():
