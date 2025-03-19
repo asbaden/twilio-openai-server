@@ -10,17 +10,36 @@ CREATE TABLE IF NOT EXISTS scheduled_calls (
     metadata JSONB DEFAULT '{}'::jsonb
 );
 
--- Create index on scheduled_time for efficient querying
+-- Create index on scheduled_time for faster queries
 CREATE INDEX IF NOT EXISTS idx_scheduled_calls_scheduled_time ON scheduled_calls(scheduled_time);
 
--- Create index on status for efficient querying
+-- Create index on status for faster queries
 CREATE INDEX IF NOT EXISTS idx_scheduled_calls_status ON scheduled_calls(status);
 
--- Enable Row Level Security (RLS)
+-- Add RLS (Row Level Security) policies
 ALTER TABLE scheduled_calls ENABLE ROW LEVEL SECURITY;
 
--- Create policy to allow all operations (you may want to restrict this based on your needs)
-CREATE POLICY "Allow all operations on scheduled_calls" ON scheduled_calls
-    FOR ALL
+-- Allow all authenticated users to read scheduled calls
+CREATE POLICY "Allow authenticated users to read scheduled calls"
+    ON scheduled_calls FOR SELECT
+    TO authenticated
+    USING (true);
+
+-- Allow all authenticated users to insert scheduled calls
+CREATE POLICY "Allow authenticated users to insert scheduled calls"
+    ON scheduled_calls FOR INSERT
+    TO authenticated
+    WITH CHECK (true);
+
+-- Allow all authenticated users to update their own scheduled calls
+CREATE POLICY "Allow authenticated users to update their own scheduled calls"
+    ON scheduled_calls FOR UPDATE
+    TO authenticated
     USING (true)
-    WITH CHECK (true); 
+    WITH CHECK (true);
+
+-- Allow all authenticated users to delete their own scheduled calls
+CREATE POLICY "Allow authenticated users to delete their own scheduled calls"
+    ON scheduled_calls FOR DELETE
+    TO authenticated
+    USING (true); 
