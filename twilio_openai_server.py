@@ -184,96 +184,116 @@ def voice():
 @sock.route('/media-stream')
 def handle_media_stream(ws):
     """Handle WebSocket connection for media streaming"""
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
     try:
+        # Create a new event loop for this thread
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+        # Run the async handler
         loop.run_until_complete(handle_media_stream_async(ws))
     except Exception as e:
         logger.error(f"Error in handle_media_stream: {str(e)}")
         logger.error(traceback.format_exc())
     finally:
-        loop.close()
+        try:
+            loop.close()
+        except:
+            pass
 
 async def handle_media_stream_async(ws):
     """Async handler for media streaming"""
     try:
+        # Verify WebSocket is valid
+        if not ws:
+            logger.error("Invalid WebSocket connection")
+            return
+            
         # Send initial connection confirmation
-        await ws.send(json.dumps({"event": "connected"}))
-        logger.info("Sent initial connection confirmation")
+        try:
+            await ws.send(json.dumps({"event": "connected"}))
+            logger.info("Sent initial connection confirmation")
+        except Exception as e:
+            logger.error(f"Error sending connection confirmation: {str(e)}")
+            return
         
         # Connect to OpenAI Realtime API
         logger.info("Connecting to OpenAI Realtime API...")
         logger.debug(f"Using OpenAI API Key: sk-tX{OPENAI_API_KEY[:4]}...")
         
-        async with websockets.connect(
-            "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-10-01",
-            extra_headers={
-                "Authorization": f"Bearer {OPENAI_API_KEY}",
-                "OpenAI-Beta": "realtime=v1"
-            }
-        ) as openai_ws:
-            logger.info("Connected to OpenAI Realtime API successfully")
-            
-            # Send session update to OpenAI
-            logger.info("Sending session update to OpenAI")
-            session_update = {
-                "type": "session.update",
-                "session": {
-                    "turn_detection": {"type": "server_vad"},
-                    "input_audio_format": "g711_ulaw",
-                    "output_audio_format": "g711_ulaw",
-                    "voice": VOICE,
-                    "instructions": SYSTEM_MESSAGE,
-                    "modalities": ["text", "audio"],
-                    "temperature": 0.8
+        try:
+            async with websockets.connect(
+                "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-10-01",
+                extra_headers={
+                    "Authorization": f"Bearer {OPENAI_API_KEY}",
+                    "OpenAI-Beta": "realtime=v1"
                 }
-            }
-            logger.debug(f"Session update data: {session_update}")
-            await openai_ws.send(json.dumps(session_update))
-            logger.info("Session update sent successfully")
-            
-            # Start WebSocket receiver
-            logger.info("Starting WebSocket receiver")
-            receiver_task = asyncio.create_task(ws_receiver(openai_ws, ws))
-            
-            # Start audio streaming between Twilio and OpenAI
-            logger.info("Starting audio streaming between Twilio and OpenAI")
-            try:
-                logger.debug("Starting to receive from Twilio")
-                async for message in ws:
-                    try:
-                        data = json.loads(message)
-                        if data.get("event") == "media":
-                            # Forward audio to OpenAI
-                            await openai_ws.send(json.dumps({
-                                "type": "input_audio_buffer.append",
-                                "audio": data["media"]["payload"]
-                            }))
-                            logger.debug("Successfully sent audio to OpenAI")
-                    except Exception as e:
-                        logger.error(f"Error processing message: {str(e)}")
-                        continue
-            except websockets.exceptions.ConnectionClosed:
-                logger.info("WebSocket connection closed normally")
-            except Exception as e:
-                logger.error(f"Error in WebSocket receive process: {str(e)}")
-                logger.error(traceback.format_exc())
-            finally:
-                # Cancel receiver task
-                receiver_task.cancel()
-                try:
-                    await receiver_task
-                except asyncio.CancelledError:
-                    pass
+            ) as openai_ws:
+                logger.info("Connected to OpenAI Realtime API successfully")
                 
-                # Close connections
+                # Send session update to OpenAI
+                logger.info("Sending session update to OpenAI")
+                session_update = {
+                    "type": "session.update",
+                    "session": {
+                        "turn_detection": {"type": "server_vad"},
+                        "input_audio_format": "g711_ulaw",
+                        "output_audio_format": "g711_ulaw",
+                        "voice": VOICE,
+                        "instructions": SYSTEM_MESSAGE,
+                        "modalities": ["text", "audio"],
+                        "temperature": 0.8
+                    }
+                }
+                logger.debug(f"Session update data: {session_update}")
+                await openai_ws.send(json.dumps(session_update))
+                logger.info("Session update sent successfully")
+                
+                # Start WebSocket receiver
+                logger.info("Starting WebSocket receiver")
+                receiver_task = asyncio.create_task(ws_receiver(openai_ws, ws))
+                
+                # Start audio streaming between Twilio and OpenAI
+                logger.info("Starting audio streaming between Twilio and OpenAI")
                 try:
-                    await ws.close()
-                    logger.info("WebSocket connection closed")
+                    logger.debug("Starting to receive from Twilio")
+                    async for message in ws:
+                        try:
+                            data = json.loads(message)
+                            if data.get("event") == "media":
+                                # Forward audio to OpenAI
+                                await openai_ws.send(json.dumps({
+                                    "type": "input_audio_buffer.append",
+                                    "audio": data["media"]["payload"]
+                                }))
+                                logger.debug("Successfully sent audio to OpenAI")
+                        except Exception as e:
+                            logger.error(f"Error processing message: {str(e)}")
+                            continue
+                except websockets.exceptions.ConnectionClosed:
+                    logger.info("WebSocket connection closed normally")
                 except Exception as e:
-                    logger.error(f"Error closing WebSocket: {str(e)}")
+                    logger.error(f"Error in WebSocket receive process: {str(e)}")
                     logger.error(traceback.format_exc())
-                
+                finally:
+                    # Cancel receiver task
+                    receiver_task.cancel()
+                    try:
+                        await receiver_task
+                    except asyncio.CancelledError:
+                        pass
+                    
+                    # Close connections
+                    try:
+                        await ws.close()
+                        logger.info("WebSocket connection closed")
+                    except Exception as e:
+                        logger.error(f"Error closing WebSocket: {str(e)}")
+                        logger.error(traceback.format_exc())
+                    
+        except Exception as e:
+            logger.error(f"Error connecting to OpenAI: {str(e)}")
+            logger.error(traceback.format_exc())
+            
     except Exception as e:
         logger.error(f"Error in handle_media_stream_async: {str(e)}")
         logger.error(traceback.format_exc())
