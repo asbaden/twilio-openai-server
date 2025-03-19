@@ -38,6 +38,7 @@ OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
 TWILIO_ACCOUNT_SID = os.getenv('TWILIO_ACCOUNT_SID')
 TWILIO_AUTH_TOKEN = os.getenv('TWILIO_AUTH_TOKEN')
 TWILIO_PHONE_NUMBER = os.getenv('TWILIO_PHONE_NUMBER')
+RENDER_URL = os.getenv('RENDER_URL', 'twilio-openai-server.onrender.com')
 VOICE = "echo"  # Options: alloy, ash, ballad, coral, echo, sage, shimmer, verse
 SYSTEM_MESSAGE = "You are Claude, a helpful AI assistant speaking with Gus. Keep your responses concise and conversational. You're speaking on a phone call."
 LOG_EVENT_TYPES = ["session.updated", "response.text.delta", "turn.start", "turn.end", "error"]
@@ -98,9 +99,11 @@ def schedule_call():
         # Validate and format scheduled time
         scheduled_time = validate_scheduled_time(data['scheduled_time'])
         
-        # Construct the voice URL
-        voice_url = f"https://{request.host}/voice"
+        # Construct the voice URL and callback URL
+        voice_url = f"https://{RENDER_URL}/voice"
+        callback_url = f"https://{RENDER_URL}/call_status"
         logger.info(f"Voice URL for scheduled call: {voice_url}")
+        logger.info(f"Callback URL for scheduled call: {callback_url}")
         
         # Insert into Supabase
         result = supabase.table('scheduled_calls').insert({
@@ -108,7 +111,8 @@ def schedule_call():
             'scheduled_time': scheduled_time,
             'status': 'pending',
             'metadata': data.get('metadata', {}),
-            'voice_url': voice_url
+            'voice_url': voice_url,
+            'callback_url': callback_url
         }).execute()
         
         logger.info(f"Scheduled call created: {result.data[0]}")
@@ -120,7 +124,9 @@ def schedule_call():
                     "id": result.data[0]['id'],
                     "phone_number": phone_number,
                     "scheduled_time": scheduled_time,
-                    "status": "pending"
+                    "status": "pending",
+                    "voice_url": voice_url,
+                    "callback_url": callback_url
                 }
             }),
             status=200,
@@ -159,8 +165,9 @@ def check_scheduled_calls():
                 # If the scheduled time has passed
                 if scheduled_time <= now:
                     try:
-                        # Get the voice URL from the call record or construct it
-                        voice_url = call.get('voice_url') or f"https://{os.getenv('RENDER_URL', 'twilio-openai-server.onrender.com')}/voice"
+                        # Get the voice URL and callback URL from the call record
+                        voice_url = call.get('voice_url') or f"https://{RENDER_URL}/voice"
+                        callback_url = call.get('callback_url') or f"https://{RENDER_URL}/call_status"
                         
                         # Make the call using Twilio
                         response = requests.post(
@@ -170,7 +177,7 @@ def check_scheduled_calls():
                                 'To': call['phone_number'],
                                 'From': TWILIO_PHONE_NUMBER,
                                 'Url': voice_url,
-                                'StatusCallback': f"https://{request.host}/call_status" if request else None,
+                                'StatusCallback': callback_url,
                                 'StatusCallbackEvent': ['initiated', 'ringing', 'answered', 'completed'],
                                 'StatusCallbackMethod': 'POST'
                             }
