@@ -185,6 +185,10 @@ def voice():
 def handle_media_stream(ws):
     """Handle WebSocket connection for media streaming"""
     try:
+        # Create a new event loop for this thread
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
         # Send initial connection confirmation
         ws.send(json.dumps({"event": "connected"}))
         logger.info("Sent initial connection confirmation")
@@ -193,48 +197,53 @@ def handle_media_stream(ws):
         logger.info("Connecting to OpenAI Realtime API...")
         logger.debug(f"Using OpenAI API Key: sk-tX{OPENAI_API_KEY[:4]}...")
         
-        with websockets.connect(
-            "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-10-01",
-            extra_headers={
-                "Authorization": f"Bearer {OPENAI_API_KEY}",
-                "OpenAI-Beta": "realtime=v1"
-            }
-        ) as openai_ws:
-            logger.info("Connected to OpenAI Realtime API successfully")
-            
-            # Send session update to OpenAI
-            logger.info("Sending session update to OpenAI")
-            session_update = {
-                "type": "session.update",
-                "session": {
-                    "turn_detection": {"type": "server_vad"},
-                    "input_audio_format": "g711_ulaw",
-                    "output_audio_format": "g711_ulaw",
-                    "voice": VOICE,
-                    "instructions": SYSTEM_MESSAGE,
-                    "modalities": ["text", "audio"],
-                    "temperature": 0.8
+        # Create a new event loop for the WebSocket connection
+        async def connect_to_openai():
+            async with websockets.connect(
+                "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-10-01",
+                extra_headers={
+                    "Authorization": f"Bearer {OPENAI_API_KEY}",
+                    "OpenAI-Beta": "realtime=v1"
                 }
-            }
-            logger.debug(f"Session update data: {session_update}")
-            openai_ws.send(json.dumps(session_update))
-            logger.info("Session update sent successfully")
-            
-            # Start receiving messages from Twilio
-            while True:
-                try:
-                    message = ws.receive()
-                    data = json.loads(message)
-                    if data.get("event") == "media":
-                        # Forward audio to OpenAI
-                        openai_ws.send(json.dumps({
-                            "type": "input_audio_buffer.append",
-                            "audio": data["media"]["payload"]
-                        }))
-                        logger.debug("Successfully sent audio to OpenAI")
-                except Exception as e:
-                    logger.error(f"Error processing message: {str(e)}")
-                    continue
+            ) as openai_ws:
+                logger.info("Connected to OpenAI Realtime API successfully")
+                
+                # Send session update to OpenAI
+                logger.info("Sending session update to OpenAI")
+                session_update = {
+                    "type": "session.update",
+                    "session": {
+                        "turn_detection": {"type": "server_vad"},
+                        "input_audio_format": "g711_ulaw",
+                        "output_audio_format": "g711_ulaw",
+                        "voice": VOICE,
+                        "instructions": SYSTEM_MESSAGE,
+                        "modalities": ["text", "audio"],
+                        "temperature": 0.8
+                    }
+                }
+                logger.debug(f"Session update data: {session_update}")
+                await openai_ws.send(json.dumps(session_update))
+                logger.info("Session update sent successfully")
+                
+                # Start receiving messages from Twilio
+                while True:
+                    try:
+                        message = ws.receive()
+                        data = json.loads(message)
+                        if data.get("event") == "media":
+                            # Forward audio to OpenAI
+                            await openai_ws.send(json.dumps({
+                                "type": "input_audio_buffer.append",
+                                "audio": data["media"]["payload"]
+                            }))
+                            logger.debug("Successfully sent audio to OpenAI")
+                    except Exception as e:
+                        logger.error(f"Error processing message: {str(e)}")
+                        continue
+        
+        # Run the async function in the event loop
+        loop.run_until_complete(connect_to_openai())
                 
     except Exception as e:
         logger.error(f"Error in handle_media_stream: {str(e)}")
