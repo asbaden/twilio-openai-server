@@ -185,6 +185,7 @@ def voice():
 @sock.route('/media-stream')
 def handle_media_stream(ws):
     """Handle WebSocket connection for media streaming"""
+    openai_ws = None
     try:
         logger.info("Client connected to WebSocket")
         
@@ -196,6 +197,46 @@ def handle_media_stream(ws):
         logger.info("Connecting to OpenAI Realtime API...")
         logger.debug(f"Using OpenAI API Key: sk-tX{OPENAI_API_KEY[:4]}...")
         
+        # Create event to signal when OpenAI connection is ready
+        openai_ready = threading.Event()
+        
+        def on_open(wsapp):
+            logger.info("OpenAI WebSocket opened")
+            openai_ready.set()
+        
+        def on_message(wsapp, message):
+            try:
+                response = json.loads(message)
+                
+                if response.get("type") in LOG_EVENT_TYPES:
+                    logger.info(f"Received event from OpenAI: {response['type']}")
+                    logger.debug(f"Event data: {response}")
+                    
+                if response.get("type") == "output_audio_buffer.append":
+                    # Forward audio to Twilio
+                    ws.send(json.dumps({
+                        "event": "media",
+                        "media": {
+                            "payload": response["audio"]
+                        }
+                    }))
+                    logger.debug("Successfully sent audio to Twilio")
+                    
+                elif response.get("type") == "response.text.delta":
+                    # Log text responses
+                    logger.info(f"AI response: {response.get('text', '')}")
+                    
+            except Exception as e:
+                logger.error(f"Error handling OpenAI message: {str(e)}")
+                logger.error(traceback.format_exc())
+        
+        def on_error(wsapp, error):
+            logger.error(f"OpenAI WebSocket error: {str(error)}")
+            logger.error(traceback.format_exc())
+        
+        def on_close(wsapp, close_status_code, close_msg):
+            logger.info(f"OpenAI WebSocket closed: {close_status_code} - {close_msg}")
+        
         # Create WebSocket connection to OpenAI
         openai_ws = websocket.WebSocketApp(
             "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-10-01",
@@ -203,9 +244,10 @@ def handle_media_stream(ws):
                 "Authorization": f"Bearer {OPENAI_API_KEY}",
                 "OpenAI-Beta": "realtime=v1"
             },
-            on_message=lambda ws, msg: handle_openai_message(ws, msg, twilio_ws=ws),
-            on_error=lambda ws, err: logger.error(f"OpenAI WebSocket error: {err}"),
-            on_close=lambda ws: logger.info("OpenAI WebSocket closed")
+            on_open=on_open,
+            on_message=on_message,
+            on_error=on_error,
+            on_close=on_close
         )
         
         # Start OpenAI WebSocket connection in a separate thread
@@ -213,7 +255,11 @@ def handle_media_stream(ws):
         openai_thread.daemon = True
         openai_thread.start()
         
-        logger.info("Connected to OpenAI Realtime API successfully")
+        # Wait for OpenAI connection to be ready
+        if not openai_ready.wait(timeout=10):
+            raise Exception("Timeout waiting for OpenAI connection")
+        
+        logger.info("OpenAI connection ready")
         
         # Send session update to OpenAI
         logger.info("Sending session update to OpenAI")
@@ -256,44 +302,20 @@ def handle_media_stream(ws):
                     
             except Exception as e:
                 logger.error(f"Error processing Twilio message: {str(e)}")
-                continue
+                logger.error(traceback.format_exc())
+                break
                 
     except Exception as e:
         logger.error(f"Error in handle_media_stream: {str(e)}")
         logger.error(traceback.format_exc())
     finally:
         try:
-            openai_ws.close()
+            if openai_ws:
+                openai_ws.close()
             ws.close()
             logger.info("WebSocket connections closed")
         except:
             pass
-
-def handle_openai_message(ws, message, twilio_ws):
-    """Handle messages received from OpenAI WebSocket"""
-    try:
-        response = json.loads(message)
-        
-        if response.get("type") in LOG_EVENT_TYPES:
-            logger.info(f"Received event from OpenAI: {response['type']}")
-            logger.debug(f"Event data: {response}")
-            
-        if response.get("type") == "output_audio_buffer.append":
-            # Forward audio to Twilio
-            twilio_ws.send(json.dumps({
-                "event": "media",
-                "media": {
-                    "payload": response["audio"]
-                }
-            }))
-            logger.debug("Successfully sent audio to Twilio")
-            
-        elif response.get("type") == "response.text.delta":
-            # Log text responses
-            logger.info(f"AI response: {response.get('text', '')}")
-            
-    except Exception as e:
-        logger.error(f"Error handling OpenAI message: {str(e)}")
 
 # Main function
 def main():
