@@ -169,23 +169,31 @@ def schedule_call():
 
 def check_scheduled_calls():
     """Background task to check for and execute scheduled calls"""
+    logger.info("Starting scheduled calls checker")
     while True:
         try:
             # Get current time in UTC
             now = datetime.now(timezone.utc)
+            logger.debug(f"Checking for scheduled calls at {now.isoformat()}")
             
             # Query for pending calls that are due
             result = supabase.table('scheduled_calls').select("*").eq('status', 'pending').execute()
+            logger.info(f"Found {len(result.data)} pending calls")
             
             for call in result.data:
                 scheduled_time = datetime.fromisoformat(call['scheduled_time'].replace('Z', '+00:00'))
+                logger.debug(f"Checking call {call['id']} scheduled for {scheduled_time.isoformat()}")
                 
                 # If the scheduled time has passed
                 if scheduled_time <= now:
                     try:
+                        logger.info(f"Processing call {call['id']} scheduled for {scheduled_time.isoformat()}")
+                        
                         # Get the voice URL and callback URL from the call record
                         voice_url = call.get('voice_url') or f"https://{RENDER_URL}/voice"
                         callback_url = call.get('callback_url') or f"https://{RENDER_URL}/call_status"
+                        
+                        logger.info(f"Making Twilio API call to {voice_url} with callback {callback_url}")
                         
                         # Make the call using Twilio
                         response = requests.post(
@@ -202,24 +210,27 @@ def check_scheduled_calls():
                         )
                         
                         response_data = response.json()
+                        logger.debug(f"Twilio API response: {response_data}")
                         
                         if response.status_code == 201:
                             # Update call status to in_progress
+                            logger.info(f"Call {call['id']} initiated successfully with SID {response_data['sid']}")
                             supabase.table('scheduled_calls').update({
                                 'status': 'in_progress',
                                 'call_sid': response_data['sid'],
                                 'started_at': datetime.now(timezone.utc).isoformat(),
                                 'twilio_response': response_data
                             }).eq('id', call['id']).execute()
-                            logger.info(f"Successfully initiated call {call['id']} with SID {response_data['sid']}")
+                            logger.info(f"Updated call {call['id']} status to in_progress")
                         else:
                             # Update call status to failed
+                            logger.error(f"Failed to initiate call {call['id']}: {response.text}")
                             supabase.table('scheduled_calls').update({
                                 'status': 'failed',
                                 'error_message': f"Twilio API error: {response.text}",
                                 'twilio_response': response_data
                             }).eq('id', call['id']).execute()
-                            logger.error(f"Failed to initiate call {call['id']}: {response.text}")
+                            logger.info(f"Updated call {call['id']} status to failed")
                             
                     except Exception as e:
                         logger.error(f"Error processing call {call['id']}: {str(e)}")
@@ -229,8 +240,10 @@ def check_scheduled_calls():
                             'status': 'failed',
                             'error_message': str(e)
                         }).eq('id', call['id']).execute()
+                        logger.info(f"Updated call {call['id']} status to failed due to error")
             
             # Sleep for 1 minute before checking again
+            logger.debug("Sleeping for 60 seconds before next check")
             time.sleep(60)
             
         except Exception as e:
@@ -455,6 +468,12 @@ def main():
     """Main function"""
     logger.info("Starting Twilio-OpenAI server")
     logger.info(f"Using OpenAI voice: {VOICE}")
+    
+    # Start the background task for checking scheduled calls
+    scheduler_thread = threading.Thread(target=check_scheduled_calls)
+    scheduler_thread.daemon = True
+    scheduler_thread.start()
+    logger.info("Started background task for checking scheduled calls")
     
     # Start the Flask app
     app.run(host='0.0.0.0', port=int(os.getenv('PORT', 5000)), debug=True)
