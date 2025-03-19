@@ -46,6 +46,103 @@ LOG_EVENT_TYPES = ["session.updated", "response.text.delta", "turn.start", "turn
 audio_packets_from_twilio = 0
 audio_packets_to_twilio = 0
 
+def validate_phone_number(phone_number):
+    """Validate phone number format and add + prefix if needed"""
+    # Remove any spaces or special characters
+    cleaned = ''.join(filter(str.isdigit, phone_number))
+    
+    # Add country code if not present
+    if len(cleaned) == 10:  # US number without country code
+        return f"+1{cleaned}"
+    elif len(cleaned) == 11 and cleaned.startswith('1'):  # US number with country code
+        return f"+{cleaned}"
+    elif cleaned.startswith('1'):  # Number already has country code
+        return f"+{cleaned}"
+    else:
+        raise ValueError("Invalid phone number format. Please provide a valid US phone number.")
+
+def validate_scheduled_time(scheduled_time):
+    """Validate scheduled time format and ensure it's in the future"""
+    try:
+        # Parse the scheduled time
+        scheduled = datetime.fromisoformat(scheduled_time.replace('Z', '+00:00'))
+        
+        # Ensure it's in the future
+        if scheduled <= datetime.now(timezone.utc):
+            raise ValueError("Scheduled time must be in the future")
+            
+        return scheduled.isoformat()
+    except Exception as e:
+        raise ValueError(f"Invalid scheduled time format. Please use ISO format (YYYY-MM-DDTHH:MM:SSZ). Error: {str(e)}")
+
+@app.route('/schedule_call', methods=['POST'])
+def schedule_call():
+    """Handle call scheduling requests"""
+    try:
+        data = request.get_json()
+        logger.info(f"Received scheduling request: {data}")
+        
+        # Validate required fields
+        if not data:
+            raise ValueError("Request body is required")
+            
+        if 'phone_number' not in data:
+            raise ValueError("phone_number is required")
+            
+        if 'scheduled_time' not in data:
+            raise ValueError("scheduled_time is required")
+        
+        # Validate and format phone number
+        phone_number = validate_phone_number(data['phone_number'])
+        
+        # Validate and format scheduled time
+        scheduled_time = validate_scheduled_time(data['scheduled_time'])
+        
+        # Construct the voice URL
+        voice_url = f"https://{request.host}/voice"
+        logger.info(f"Voice URL for scheduled call: {voice_url}")
+        
+        # Insert into Supabase
+        result = supabase.table('scheduled_calls').insert({
+            'phone_number': phone_number,
+            'scheduled_time': scheduled_time,
+            'status': 'pending',
+            'metadata': data.get('metadata', {}),
+            'voice_url': voice_url
+        }).execute()
+        
+        logger.info(f"Scheduled call created: {result.data[0]}")
+        
+        return Response(
+            json.dumps({
+                "message": "Call scheduled successfully",
+                "data": {
+                    "id": result.data[0]['id'],
+                    "phone_number": phone_number,
+                    "scheduled_time": scheduled_time,
+                    "status": "pending"
+                }
+            }),
+            status=200,
+            mimetype='application/json'
+        )
+        
+    except ValueError as e:
+        logger.warning(f"Validation error in schedule_call: {str(e)}")
+        return Response(
+            json.dumps({"error": str(e)}),
+            status=400,
+            mimetype='application/json'
+        )
+    except Exception as e:
+        logger.error(f"Error scheduling call: {str(e)}")
+        logger.error(traceback.format_exc())
+        return Response(
+            json.dumps({"error": "Internal server error. Please try again later."}),
+            status=500,
+            mimetype='application/json'
+        )
+
 def check_scheduled_calls():
     """Background task to check for and execute scheduled calls"""
     while True:
@@ -62,6 +159,9 @@ def check_scheduled_calls():
                 # If the scheduled time has passed
                 if scheduled_time <= now:
                     try:
+                        # Get the voice URL from the call record or construct it
+                        voice_url = call.get('voice_url') or f"https://{os.getenv('RENDER_URL', 'twilio-openai-server.onrender.com')}/voice"
+                        
                         # Make the call using Twilio
                         response = requests.post(
                             f'https://api.twilio.com/2010-04-01/Accounts/{TWILIO_ACCOUNT_SID}/Calls.json',
@@ -69,82 +169,86 @@ def check_scheduled_calls():
                             data={
                                 'To': call['phone_number'],
                                 'From': TWILIO_PHONE_NUMBER,
-                                'Url': f'https://{os.getenv("RENDER_URL", "twilio-openai-server.onrender.com")}/voice'
+                                'Url': voice_url,
+                                'StatusCallback': f"https://{request.host}/call_status" if request else None,
+                                'StatusCallbackEvent': ['initiated', 'ringing', 'answered', 'completed'],
+                                'StatusCallbackMethod': 'POST'
                             }
                         )
                         
+                        response_data = response.json()
+                        
                         if response.status_code == 201:
-                            # Update call status to completed
+                            # Update call status to in_progress
                             supabase.table('scheduled_calls').update({
-                                'status': 'completed',
-                                'call_sid': response.json()['sid']
+                                'status': 'in_progress',
+                                'call_sid': response_data['sid'],
+                                'started_at': datetime.now(timezone.utc).isoformat(),
+                                'twilio_response': response_data
                             }).eq('id', call['id']).execute()
-                            logger.info(f"Successfully initiated call {call['id']}")
+                            logger.info(f"Successfully initiated call {call['id']} with SID {response_data['sid']}")
                         else:
                             # Update call status to failed
                             supabase.table('scheduled_calls').update({
                                 'status': 'failed',
-                                'error_message': f"Twilio API error: {response.text}"
+                                'error_message': f"Twilio API error: {response.text}",
+                                'twilio_response': response_data
                             }).eq('id', call['id']).execute()
                             logger.error(f"Failed to initiate call {call['id']}: {response.text}")
                             
                     except Exception as e:
+                        logger.error(f"Error processing call {call['id']}: {str(e)}")
+                        logger.error(traceback.format_exc())
                         # Update call status to failed
                         supabase.table('scheduled_calls').update({
                             'status': 'failed',
                             'error_message': str(e)
                         }).eq('id', call['id']).execute()
-                        logger.error(f"Error processing call {call['id']}: {str(e)}")
             
             # Sleep for 1 minute before checking again
             time.sleep(60)
             
         except Exception as e:
             logger.error(f"Error in check_scheduled_calls: {str(e)}")
+            logger.error(traceback.format_exc())
             time.sleep(60)  # Sleep for 1 minute before retrying
 
-# Start the background task
-scheduler_thread = threading.Thread(target=check_scheduled_calls, daemon=True)
-scheduler_thread.start()
-
-@app.route('/schedule_call', methods=['POST'])
-def schedule_call():
-    """Handle call scheduling requests"""
+@app.route('/call_status', methods=['POST'])
+def call_status():
+    """Handle Twilio call status callbacks"""
     try:
-        data = request.get_json()
-        logger.info(f"Received scheduling request: {data}")
+        # Get call details from the request
+        call_sid = request.values.get('CallSid')
+        call_status = request.values.get('CallStatus')
         
-        # Validate required fields
-        if not data or 'phone_number' not in data or 'scheduled_time' not in data:
-            return Response(
-                json.dumps({"error": "Missing required fields: phone_number and scheduled_time"}),
-                status=400,
-                mimetype='application/json'
-            )
+        logger.info(f"Received status update for call {call_sid}: {call_status}")
         
-        # Insert into Supabase
-        result = supabase.table('scheduled_calls').insert({
-            'phone_number': data['phone_number'],
-            'scheduled_time': data['scheduled_time'],
-            'status': 'pending',
-            'metadata': data.get('metadata', {})
-        }).execute()
+        # Find the call in our database
+        result = supabase.table('scheduled_calls').select("*").eq('call_sid', call_sid).execute()
         
-        logger.info(f"Scheduled call created: {result}")
+        if result.data:
+            call = result.data[0]
+            
+            # Update the call status
+            update_data = {
+                'twilio_status': call_status,
+                'last_status_update': datetime.now(timezone.utc).isoformat()
+            }
+            
+            # If the call is complete or failed, update the status
+            if call_status in ['completed', 'failed', 'busy', 'no-answer', 'canceled']:
+                update_data['status'] = 'completed'
+                update_data['completed_at'] = datetime.now(timezone.utc).isoformat()
+            
+            supabase.table('scheduled_calls').update(update_data).eq('id', call['id']).execute()
+            logger.info(f"Updated status for call {call['id']}")
         
-        return Response(
-            json.dumps({"message": "Call scheduled successfully", "data": result.data[0]}),
-            status=200,
-            mimetype='application/json'
-        )
+        return Response(status=200)
         
     except Exception as e:
-        logger.error(f"Error scheduling call: {str(e)}")
-        return Response(
-            json.dumps({"error": str(e)}),
-            status=500,
-            mimetype='application/json'
-        )
+        logger.error(f"Error handling call status: {str(e)}")
+        logger.error(traceback.format_exc())
+        return Response(status=500)
 
 # Route to handle incoming calls
 @app.route('/voice', methods=['POST'])
